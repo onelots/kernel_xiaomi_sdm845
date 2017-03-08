@@ -903,28 +903,20 @@ discard:
 }
 
 static struct sock *__udp6_lib_demux_lookup(struct net *net,
-					    __be16 loc_port,
-					    const struct in6_addr *loc_addr,
-					    __be16 rmt_port,
-					    const struct in6_addr *rmt_addr,
-					    int dif)
+			__be16 loc_port, const struct in6_addr *loc_addr,
+			__be16 rmt_port, const struct in6_addr *rmt_addr,
+			int dif)
 {
-	unsigned short hnum = ntohs(loc_port);
-	unsigned int hash2 = udp6_portaddr_hash(net, loc_addr, hnum);
-	unsigned int slot2 = hash2 & udp_table.mask;
-	struct udp_hslot *hslot2 = &udp_table.hash2[slot2];
-
-	const __portpair ports = INET_COMBINED_PORTS(rmt_port, hnum);
 	struct sock *sk;
 
-	udp_portaddr_for_each_entry_rcu(sk, &hslot2->head) {
-		if (sk->sk_state == TCP_ESTABLISHED &&
-		    INET6_MATCH(sk, net, rmt_addr, loc_addr, ports, dif))
-			return sk;
-		/* Only check first socket in chain */
-		break;
-	}
-	return NULL;
+	rcu_read_lock();
+	sk = __udp6_lib_lookup(net, rmt_addr, rmt_port, loc_addr, loc_port,
+			       dif, 0, &udp_table, NULL);
+	if (sk && !atomic_inc_not_zero(&sk->sk_refcnt))
+		sk = NULL;
+	rcu_read_unlock();
+
+	return sk;
 }
 
 static void udp_v6_early_demux(struct sk_buff *skb)
@@ -949,7 +941,7 @@ static void udp_v6_early_demux(struct sk_buff *skb)
 	else
 		return;
 
-	if (!sk || !atomic_inc_not_zero_hint(&sk->sk_refcnt, 2))
+	if (!sk)
 		return;
 
 	skb->sk = sk;
@@ -959,11 +951,12 @@ static void udp_v6_early_demux(struct sk_buff *skb)
 	if (dst)
 		dst = dst_check(dst, inet6_sk(sk)->rx_dst_cookie);
 	if (dst) {
-		/* set noref for now.
-		 * any place which wants to hold dst has to call
-		 * dst_hold_safe()
-		 */
-		skb_dst_set_noref(skb, dst);
+		if (dst->flags & DST_NOCACHE) {
+			if (likely(atomic_inc_not_zero(&dst->__refcnt)))
+				skb_dst_set(skb, dst);
+		} else {
+			skb_dst_set_noref(skb, dst);
+		}
 	}
 }
 
